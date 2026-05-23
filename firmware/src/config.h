@@ -107,13 +107,15 @@ static const int FULL_REFRESH_INTERVAL = 10;  // Full refresh every N updates to
 
 // ── Config defaults ─────────────────────────────────────────
 static const char *DEFAULT_SERVER  = "";  // Must be set via captive portal
-static const int   WIFI_TIMEOUT    = 15000;   // ms
+static const int   WIFI_TIMEOUT    = 15000;   // ms per WiFi attempt
+static const int   WIFI_CONNECT_ATTEMPTS = 3; // Clean retries for intermittent AP association failures
 static const int   HTTP_TIMEOUT    = 30000;   // ms
 static const int   CFG_BTN_HOLD_MS = 2000;    // Long press duration to trigger config mode
 static const int   AI_CHAT_BTN_HOLD_MS = 3000; // Long press duration to enter AI chat mode
 static const int   SHORT_PRESS_MIN_MS = 50;   // Minimum short press duration (debounce)
 static const int   LIVE_POLL_MS = 5000;       // Poll interval for pending remote actions
 static const int   LIVE_WIFI_RETRY_MS = 5000; // Retry interval when WiFi is disconnected
+static const int   DISPLAY_REFRESH_MIN = 1;   // Fetch and refresh image every N minutes while awake
 static const unsigned long HEARTBEAT_INTERVAL_MS = 10UL * 60UL * 1000UL;
 static const int   MAX_RETRY_COUNT = 5;       // Max retries before deep sleep
 // Progressive retry delays in seconds: 5s, 15s, 30s, 60s, 120s

@@ -10,6 +10,7 @@
 #include <WebSocketsClient.h>
 #include <LittleFS.h>
 #include <mbedtls/base64.h>
+#include <esp_wifi.h>
 #include <time.h>
 #if defined(BOARD_PROFILE_ESP32_C3_WROOM02)
 #include <esp_adc_cal.h>
@@ -34,6 +35,9 @@ static bool checkAbort() {
 }
 
 static bool beginHttpForUrl(HTTPClient &http, WiFiClient &plainClient, WiFiClientSecure &secClient, const String &url);
+static String normalizeDirectImageUrl(const String &url);
+static bool readImagePayloadFromHttp(HTTPClient &http);
+static bool fetchDirectImageUrl(const String &url);
 static bool recoverDeviceTokenIfUnauthorized(int code);
 static String extractJsonStringField(const String &body, const char *key);
 static String extractJsonBoolField(const String &body, const char *key);
@@ -57,23 +61,166 @@ static QueueHandle_t gVoiceWsEventQueue = nullptr;
 
 // ── WiFi connection ─────────────────────────────────────────
 
+static bool wifiEventHandlerInstalled = false;
+static volatile int lastWifiDisconnectReason = 0;
+
+static const char *wifiStatusName(wl_status_t status) {
+    switch (status) {
+        case WL_IDLE_STATUS: return "IDLE";
+        case WL_NO_SSID_AVAIL: return "NO_SSID";
+        case WL_SCAN_COMPLETED: return "SCAN_DONE";
+        case WL_CONNECTED: return "CONNECTED";
+        case WL_CONNECT_FAILED: return "CONNECT_FAILED";
+        case WL_CONNECTION_LOST: return "CONNECTION_LOST";
+        case WL_DISCONNECTED: return "DISCONNECTED";
+        default: return "UNKNOWN";
+    }
+}
+
+static const char *wifiDisconnectReasonName(int reason) {
+    switch (reason) {
+        case 0: return "NONE";
+        case 2: return "AUTH_EXPIRE";
+        case 4: return "ASSOC_EXPIRE";
+        case 5: return "ASSOC_TOOMANY";
+        case 8: return "ASSOC_LEAVE";
+        case 15: return "4WAY_HANDSHAKE_TIMEOUT";
+        case 17: return "IE_INVALID";
+        case 23: return "IEEE802_1X_AUTH_FAILED";
+        case 24: return "CIPHER_SUITE_REJECTED";
+        case 201: return "NO_AP_FOUND";
+        case 202: return "AUTH_FAIL";
+        case 203: return "ASSOC_FAIL";
+        case 204: return "HANDSHAKE_TIMEOUT";
+        case 205: return "CONNECTION_FAIL";
+        default: return "UNKNOWN";
+    }
+}
+
+static void ensureWiFiEventHandler() {
+    if (wifiEventHandlerInstalled) return;
+    WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+        if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+            lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+            Serial.printf("[WIFI] disconnected reason=%d %s\n",
+                          lastWifiDisconnectReason,
+                          wifiDisconnectReasonName(lastWifiDisconnectReason));
+        }
+    });
+    wifiEventHandlerInstalled = true;
+}
+
+static void applyConservativeWiFiSettings() {
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+}
+
+static bool findBestConfiguredAp(uint8_t *bssidOut, int32_t &channelOut, int32_t &rssiOut) {
+    Serial.printf("[WIFI] Scanning for SSID: %s\n", cfgSSID.c_str());
+    int n = WiFi.scanNetworks(false, true);
+    if (n <= 0) {
+        Serial.printf("[WIFI] scan found no networks (%d)\n", n);
+        return false;
+    }
+
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i) != cfgSSID) continue;
+        int32_t rssi = WiFi.RSSI(i);
+        Serial.printf("[WIFI] candidate ch=%d rssi=%d bssid=%s\n",
+                      WiFi.channel(i), rssi, WiFi.BSSIDstr(i).c_str());
+        if (best < 0 || rssi > WiFi.RSSI(best)) best = i;
+    }
+
+    if (best < 0) {
+        Serial.println("[WIFI] configured SSID not visible in scan");
+        return false;
+    }
+
+    memcpy(bssidOut, WiFi.BSSID(best), 6);
+    channelOut = WiFi.channel(best);
+    rssiOut = WiFi.RSSI(best);
+    Serial.printf("[WIFI] selected ch=%d rssi=%d bssid=%s\n",
+                  channelOut, rssiOut, WiFi.BSSIDstr(best).c_str());
+    WiFi.scanDelete();
+    return true;
+}
+
 bool connectWiFi() {
     g_userAborted = false;
-    Serial.printf("WiFi: %s ", cfgSSID.c_str());
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+    ensureWiFiEventHandler();
+    uint8_t targetBssid[6] = {0};
+    int32_t targetChannel = 0;
+    int32_t targetRssi = 0;
 
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED) {
-        if (checkAbort()) return false;
-        if (millis() - t0 > (unsigned long)WIFI_TIMEOUT) {
-            Serial.println("TIMEOUT");
-            return false;
+    for (int attempt = 1; attempt <= WIFI_CONNECT_ATTEMPTS; attempt++) {
+        Serial.printf("WiFi: %s (attempt %d/%d) ", cfgSSID.c_str(), attempt, WIFI_CONNECT_ATTEMPTS);
+        bool portalStyleAttempt = (attempt >= 2);
+        if (portalStyleAttempt) {
+            Serial.print("[WIFI] portal-style AP_STA warmup ");
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.softAP("InkSight-WiFi-Warmup", nullptr, 1, true);
+        } else {
+            WiFi.mode(WIFI_STA);
         }
-        delay(300);
-        Serial.print(".");
+        applyConservativeWiFiSettings();
+        WiFi.setSleep(false);
+        WiFi.disconnect(false);
+        delay(150);
+        lastWifiDisconnectReason = 0;
+
+        bool hasTargetAp = false;
+        if (attempt == 1 || targetChannel == 0) {
+            hasTargetAp = findBestConfiguredAp(targetBssid, targetChannel, targetRssi);
+            Serial.printf("WiFi: %s (attempt %d/%d) ", cfgSSID.c_str(), attempt, WIFI_CONNECT_ATTEMPTS);
+        } else {
+            hasTargetAp = true;
+        }
+
+        if (hasTargetAp && attempt > 1) {
+            Serial.printf("[WIFI] connecting locked to ch=%d bssid=%02X:%02X:%02X:%02X:%02X:%02X\n",
+                          targetChannel,
+                          targetBssid[0], targetBssid[1], targetBssid[2],
+                          targetBssid[3], targetBssid[4], targetBssid[5]);
+            WiFi.begin(cfgSSID.c_str(), cfgPass.c_str(), targetChannel, targetBssid);
+        } else {
+            Serial.println("[WIFI] connecting by SSID");
+            Serial.printf("WiFi: %s (attempt %d/%d) ", cfgSSID.c_str(), attempt, WIFI_CONNECT_ATTEMPTS);
+            WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+        }
+
+        unsigned long t0 = millis();
+        while (WiFi.status() != WL_CONNECTED) {
+            if (checkAbort()) return false;
+            if (millis() - t0 > (unsigned long)WIFI_TIMEOUT) {
+                wl_status_t status = WiFi.status();
+                Serial.printf("TIMEOUT status=%d %s reason=%d %s\n",
+                              (int)status,
+                              wifiStatusName(status),
+                              lastWifiDisconnectReason,
+                              wifiDisconnectReasonName(lastWifiDisconnectReason));
+                break;
+            }
+            delay(300);
+            Serial.print(".");
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.printf(" OK  IP=%s RSSI=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+            break;
+        }
+        WiFi.disconnect(false);
+        if (attempt < WIFI_CONNECT_ATTEMPTS) {
+            delay(1000 * attempt);
+        }
     }
-    Serial.printf(" OK  IP=%s\n", WiFi.localIP().toString().c_str());
+
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    if (cfgDirectImageUrl.length() > 0) {
+        Serial.println("[DIRECT] Direct image URL configured, skipping backend token init");
+        return true;
+    }
     if (!ensureDeviceToken()) return false;
     if (cfgPendingPairCode.length() > 0) {
         String mac = WiFi.macAddress();
@@ -211,8 +358,27 @@ static bool readExact(WiFiClient *s, uint8_t *buf, int len) {
     return true;
 }
 
+static bool ensureTlsClock() {
+    time_t now = time(nullptr);
+    if (now > 1700000000) return true;
+
+    Serial.println("[TLS] System time is not set, syncing NTP before HTTPS");
+    syncNTP();
+    now = time(nullptr);
+    if (now > 1700000000) {
+        Serial.printf("[TLS] clock ready: %ld\n", (long)now);
+        return true;
+    } else {
+        Serial.println("[TLS] clock still not ready; HTTPS certificate checks may fail");
+        return false;
+    }
+}
+
 static bool beginHttpForUrl(HTTPClient &http, WiFiClient &plainClient, WiFiClientSecure &secClient, const String &url) {
     if (url.startsWith("https://")) {
+        ensureTlsClock();
+        secClient.setTimeout(HTTP_TIMEOUT / 1000);
+        secClient.setHandshakeTimeout(30);
         secClient.setCACert(ROOT_CA);
         return http.begin(secClient, url);
     }
@@ -355,6 +521,7 @@ static bool recoverDeviceTokenIfUnauthorized(int code) {
 
 bool postHeartbeat(bool force) {
     if (WiFi.status() != WL_CONNECTED) return false;
+    if (cfgServer.length() == 0) return false;
     unsigned long now = millis();
     if (!force && lastHeartbeatAt != 0 && now - lastHeartbeatAt < HEARTBEAT_INTERVAL_MS) {
         return true;
@@ -400,6 +567,7 @@ bool postHeartbeat(bool force) {
 bool ensureDeviceToken() {
     if (cfgDeviceToken.length() > 0) return true;
     if (WiFi.status() != WL_CONNECTED) return false;
+    if (cfgServer.length() == 0) return false;
 
     String mac = WiFi.macAddress();
     String url = cfgServer + "/api/device/" + mac + "/token";
@@ -562,6 +730,9 @@ bool fetchFocusAlertBMP() {
 bool fetchBMP(bool nextMode, bool *isFallback, String *renderedModeIdOut) {
     if (isFallback) *isFallback = false;
     if (renderedModeIdOut) *renderedModeIdOut = "";
+    if (cfgDirectImageUrl.length() > 0) {
+        return fetchDirectImageUrl(cfgDirectImageUrl);
+    }
     if (!ensureDeviceToken()) return false;
     float v = readBatteryVoltage();
     String mac = WiFi.macAddress();
@@ -643,113 +814,210 @@ bool fetchBMP(bool nextMode, bool *isFallback, String *renderedModeIdOut) {
             continue;
         }
 
-        int contentLen = http.getSize();
-        Serial.printf("Content-Length: %d\n", contentLen);
+        bool ok = readImagePayloadFromHttp(http);
+        http.end();
+        return ok;
+    }
+    return false;
+}
 
-        WiFiClient *stream = http.getStreamPtr();
+static bool fetchDirectImageUrl(const String &url) {
+    String fetchUrl = normalizeDirectImageUrl(url);
+    if (!fetchUrl.startsWith("http://") && !fetchUrl.startsWith("https://")) {
+        Serial.println("[DIRECT] invalid URL scheme");
+        return false;
+    }
+    if (fetchUrl.startsWith("https://") && !ensureTlsClock()) {
+        return false;
+    }
+    Serial.printf("[DIRECT] GET %s\n", fetchUrl.c_str());
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (checkAbort()) return false;
+        WiFiClient plainClient;
+        WiFiClientSecure secClient;
+        HTTPClient http;
+        if (!beginHttpForUrl(http, plainClient, secClient, fetchUrl)) {
+            Serial.println("[DIRECT] begin failed");
+            delay(800);
+            continue;
+        }
+        http.setTimeout(HTTP_TIMEOUT);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.addHeader("Accept-Encoding", "identity");
+
+        int code = http.GET();
+        Serial.printf("[DIRECT] HTTP code: %d\n", code);
+        if (code != 200) {
+            if (code < 0) {
+                Serial.printf("[DIRECT] HTTP error: %s\n", http.errorToString(code).c_str());
+            } else {
+                String body = http.getString();
+                Serial.printf("[DIRECT] response: %s\n", body.substring(0, 300).c_str());
+            }
+            http.end();
+            delay(800);
+            continue;
+        }
+
+        bool ok = readImagePayloadFromHttp(http);
+        http.end();
+        return ok;
+    }
+    return false;
+}
+
+static String normalizeDirectImageUrl(const String &url) {
+    String lower = url;
+    lower.toLowerCase();
+    int suffixAt = url.length();
+    int queryAt = url.indexOf('?');
+    int fragmentAt = url.indexOf('#');
+    if (queryAt >= 0 && queryAt < suffixAt) suffixAt = queryAt;
+    if (fragmentAt >= 0 && fragmentAt < suffixAt) suffixAt = fragmentAt;
+
+    String pathLower = lower.substring(0, suffixAt);
+    if (pathLower.endsWith(".bmp")) {
+        String rewritten = url.substring(0, suffixAt - 4) + ".2bpp" + url.substring(suffixAt);
+#if EPD_BPP >= 2
+        Serial.printf("[DIRECT] .bmp URL rewritten to native 2bpp: %s\n", rewritten.c_str());
+#else
+        Serial.printf("[DIRECT] .bmp URL rewritten to compact 2bpp for BW conversion: %s\n", rewritten.c_str());
+#endif
+        return rewritten;
+    }
+    return url;
+}
+
+static bool readImagePayloadFromHttp(HTTPClient &http) {
+    int contentLen = http.getSize();
+    Serial.printf("Content-Length: %d\n", contentLen);
+
+    WiFiClient *stream = http.getStreamPtr();
 
 #if EPD_BPP >= 2
-        if (contentLen == COLOR_BUF_LEN) {
-            if (!ensureColorBuf()) {
-                Serial.println("colorBuf alloc failed, skip 2bpp");
-                http.end();
-                return false;
-            }
-            if (!readExact(stream, colorBuf, COLOR_BUF_LEN)) {
-                Serial.println("Failed to read 2bpp data");
-                http.end();
-                return false;
-            }
-            useColorBuf = true;
-            http.end();
-            Serial.printf("2BPP OK  %d bytes\n", COLOR_BUF_LEN);
-            lastHeartbeatAt = millis();
-            return true;
-        }
-        Serial.printf("Not raw 2bpp (%d bytes), fallback to BMP\n", contentLen);
-        useColorBuf = false;
-#endif
-
-        uint8_t fileHeader[14];
-        if (!readExact(stream, fileHeader, 14)) {
-            Serial.println("Failed to read BMP header");
-            http.end();
+    if (contentLen == COLOR_BUF_LEN) {
+        if (!ensureColorBuf()) {
+            Serial.println("colorBuf alloc failed, skip 2bpp");
             return false;
         }
-
-        uint32_t pixelOffset = fileHeader[10]
-                             | ((uint32_t)fileHeader[11] << 8)
-                             | ((uint32_t)fileHeader[12] << 16)
-                             | ((uint32_t)fileHeader[13] << 24);
-        Serial.printf("BMP pixel offset: %u\n", pixelOffset);
-
-        // Read info header to get bit count (biBitCount at offset 28 = 14+14)
-        uint8_t infoHeader[16];
-        if (!readExact(stream, infoHeader, 16)) {
-            Serial.println("Failed to read BMP info header");
-            http.end();
+        if (!readExact(stream, colorBuf, COLOR_BUF_LEN)) {
+            Serial.println("Failed to read 2bpp data");
             return false;
         }
-        int bmpBits = infoHeader[14] | ((int)infoHeader[15] << 8);
-        Serial.printf("BMP bit count: %d\n", bmpBits);
-
-        int toSkip = pixelOffset - 14 - 16;  // skip remaining header+palette
-        while (toSkip > 0 && stream->connected()) {
-            if (stream->available()) { stream->read(); toSkip--; }
-        }
-
-        memset(imgBuf, 0xFF, IMG_BUF_LEN);
-
-        if (bmpBits <= 1) {
-            // 1-bit BMP: each row is ROW_STRIDE bytes (padded)
-            uint8_t rowBuf[ROW_STRIDE];
-            for (int bmpY = 0; bmpY < H; bmpY++) {
-                if (!readExact(stream, rowBuf, ROW_STRIDE)) {
-                    Serial.printf("Failed to read row %d\n", bmpY);
-                    http.end();
-                    return false;
-                }
-                int dispY = H - 1 - bmpY;
-                memcpy(imgBuf + dispY * ROW_BYTES, rowBuf, ROW_BYTES);
-            }
-        } else {
-            // 8-bit (or 24-bit) BMP: convert each pixel to 1 bit
-            int srcRowBytes = (W * bmpBits + 31) / 32 * 4;
-            uint8_t *srcRow = (uint8_t *)malloc(srcRowBytes);
-            if (!srcRow) {
-                Serial.println("Failed to alloc srcRow");
-                http.end();
-                return false;
-            }
-            for (int bmpY = 0; bmpY < H; bmpY++) {
-                if (!readExact(stream, srcRow, srcRowBytes)) {
-                    Serial.printf("Failed to read row %d\n", bmpY);
-                    free(srcRow);
-                    http.end();
-                    return false;
-                }
-                int dispY = H - 1 - bmpY;
-                for (int x = 0; x < W; x++) {
-                    uint8_t pixel;
-                    if (bmpBits == 8) {
-                        pixel = srcRow[x];
-                    } else {
-                        pixel = srcRow[x * 3];  // 24-bit: use blue channel
-                    }
-                    if (pixel < 128) {
-                        imgBuf[dispY * ROW_BYTES + x / 8] &= ~(0x80 >> (x % 8));
-                    }
-                }
-            }
-            free(srcRow);
-        }
-
-        http.end();
-        Serial.printf("BMP OK  %d bytes\n", IMG_BUF_LEN);
+        useColorBuf = true;
+        Serial.printf("2BPP OK  %d bytes\n", COLOR_BUF_LEN);
         lastHeartbeatAt = millis();
         return true;
     }
-    return false;
+    Serial.printf("Not raw 2bpp (%d bytes), fallback to BMP\n", contentLen);
+    useColorBuf = false;
+#else
+    if (contentLen == COLOR_BUF_LEN) {
+        uint8_t *planes = (uint8_t *)malloc(COLOR_BUF_LEN);
+        if (!planes) {
+            Serial.println("2BPP plane buffer alloc failed");
+            return false;
+        }
+        if (!readExact(stream, planes, COLOR_BUF_LEN)) {
+            free(planes);
+            Serial.println("Failed to read 2bpp plane data for BW conversion");
+            return false;
+        }
+
+        int blackBits = 0;
+        int redBits = 0;
+        for (int i = 0; i < IMG_BUF_LEN; i++) {
+            uint8_t blackPlane = planes[i];
+            uint8_t redPlane = planes[IMG_BUF_LEN + i];
+            imgBuf[i] = blackPlane & redPlane;  // 0 bit in either plane becomes black on BW panels
+            blackBits += 8 - __builtin_popcount((unsigned int)blackPlane);
+            redBits += 8 - __builtin_popcount((unsigned int)redPlane);
+        }
+        free(planes);
+        Serial.printf("2BPP planes->1BPP OK  %d bytes (black=%d red=%d)\n",
+                      COLOR_BUF_LEN, blackBits, redBits);
+        lastHeartbeatAt = millis();
+        return true;
+    }
+    Serial.printf("Not raw 2bpp (%d bytes), fallback to BMP\n", contentLen);
+#endif
+
+    uint8_t fileHeader[14];
+    if (!readExact(stream, fileHeader, 14)) {
+        Serial.println("Failed to read BMP header");
+        return false;
+    }
+    if (fileHeader[0] != 'B' || fileHeader[1] != 'M') {
+        Serial.println("Invalid BMP signature");
+        return false;
+    }
+
+    uint32_t pixelOffset = fileHeader[10]
+                         | ((uint32_t)fileHeader[11] << 8)
+                         | ((uint32_t)fileHeader[12] << 16)
+                         | ((uint32_t)fileHeader[13] << 24);
+    Serial.printf("BMP pixel offset: %u\n", pixelOffset);
+
+    // Read info header to get bit count (biBitCount at offset 28 = 14+14)
+    uint8_t infoHeader[16];
+    if (!readExact(stream, infoHeader, 16)) {
+        Serial.println("Failed to read BMP info header");
+        return false;
+    }
+    int bmpBits = infoHeader[14] | ((int)infoHeader[15] << 8);
+    Serial.printf("BMP bit count: %d\n", bmpBits);
+
+    int toSkip = pixelOffset - 14 - 16;  // skip remaining header+palette
+    while (toSkip > 0 && stream->connected()) {
+        if (stream->available()) { stream->read(); toSkip--; }
+    }
+
+    memset(imgBuf, 0xFF, IMG_BUF_LEN);
+
+    if (bmpBits <= 1) {
+        // 1-bit BMP: each row is ROW_STRIDE bytes (padded)
+        uint8_t rowBuf[ROW_STRIDE];
+        for (int bmpY = 0; bmpY < H; bmpY++) {
+            if (!readExact(stream, rowBuf, ROW_STRIDE)) {
+                Serial.printf("Failed to read row %d\n", bmpY);
+                return false;
+            }
+            int dispY = H - 1 - bmpY;
+            memcpy(imgBuf + dispY * ROW_BYTES, rowBuf, ROW_BYTES);
+        }
+    } else {
+        // 8-bit (or 24-bit) BMP: convert each pixel to 1 bit
+        int srcRowBytes = (W * bmpBits + 31) / 32 * 4;
+        uint8_t *srcRow = (uint8_t *)malloc(srcRowBytes);
+        if (!srcRow) {
+            Serial.println("Failed to alloc srcRow");
+            return false;
+        }
+        for (int bmpY = 0; bmpY < H; bmpY++) {
+            if (!readExact(stream, srcRow, srcRowBytes)) {
+                Serial.printf("Failed to read row %d\n", bmpY);
+                free(srcRow);
+                return false;
+            }
+            int dispY = H - 1 - bmpY;
+            for (int x = 0; x < W; x++) {
+                uint8_t pixel;
+                if (bmpBits == 8) {
+                    pixel = srcRow[x];
+                } else {
+                    pixel = srcRow[x * 3];  // 24-bit: use blue channel
+                }
+                if (pixel < 128) {
+                    imgBuf[dispY * ROW_BYTES + x / 8] &= ~(0x80 >> (x % 8));
+                }
+            }
+        }
+        free(srcRow);
+    }
+
+    Serial.printf("BMP OK  %d bytes\n", IMG_BUF_LEN);
+    lastHeartbeatAt = millis();
+    return true;
 }
 
 bool hasPendingRemoteAction(bool *shouldExitLive) {
@@ -1655,7 +1923,7 @@ void voiceWsClose() {
 // ── NTP time sync ───────────────────────────────────────────
 
 void syncNTP() {
-    configTime(NTP_UTC_OFFSET, 0, "ntp.aliyun.com", "pool.ntp.org");
+    configTime(NTP_UTC_OFFSET, 0, "ntp.aliyun.com", "ntp.tencent.com", "ntp.ntsc.ac.cn");
     struct tm timeinfo;
     if (getLocalTime(&timeinfo, 5000)) {
         curHour = timeinfo.tm_hour;

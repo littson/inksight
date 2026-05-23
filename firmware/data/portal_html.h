@@ -134,6 +134,10 @@ body{font-family:var(--f);background:linear-gradient(135deg,#f5f5f0,#e8e8e0);col
 </div>
 </div>
 </div>
+<div class="fg">
+<label class="lbl" id="lblDirectImage">直接图片 URL（可选）</label>
+<input type="text" class="inp" id="directImageIn" placeholder="例如: https://example.com/frame.bmp">
+</div>
 <button class="btn btn-ghost" id="cBtn" onclick="doConnect()"><span class="bt" id="btnConnText">连接并保存</span><div class="sp"></div></button>
 </div>
 
@@ -191,6 +195,8 @@ srvCusTip1:"输入你自己部署的 InkSight 后端地址（含端口）",
 srvCusTip2:"前端配置页端口，用于重启后跳转到 localhost:端口/config",
 srvUrlPh:"例如: http://192.168.1.100:8080",
 srvPortPh:"例如: 3000",
+lblDirectImage:"直接图片 URL（可选）",
+directImagePh:"例如: https://example.com/frame.bmp",
 btnConn:"连接并保存",
 s2Title:"配网完成",
 s2Next:"下一步：",
@@ -210,6 +216,7 @@ errSsid:"请选择或输入 WiFi",
 errPw:"请输入密码",
 errPwLen:"密码至少 8 位",
 errUrl:"服务器地址需以 http:// 或 https:// 开头",
+errDirectImageUrl:"直接图片 URL 需以 http:// 或 https:// 开头",
 errPort:"前端端口需为 2 到 5 位数字",
 msgConn:"正在连接 ",
 msgConnOk:"WiFi 已连接",
@@ -243,6 +250,8 @@ srvCusTip1:"Enter your self-hosted backend URL (with port)",
 srvCusTip2:"Frontend port, used for redirecting to localhost:port/config",
 srvUrlPh:"e.g. http://192.168.1.100:8080",
 srvPortPh:"e.g. 3000",
+lblDirectImage:"Direct Image URL (optional)",
+directImagePh:"e.g. https://example.com/frame.bmp",
 btnConn:"Connect & Save",
 s2Title:"Setup Complete",
 s2Next:"Next Step: ",
@@ -262,6 +271,7 @@ errSsid:"Please select or enter WiFi",
 errPw:"Please enter password",
 errPwLen:"Password must be at least 8 chars",
 errUrl:"Server URL must start with http:// or https://",
+errDirectImageUrl:"Direct Image URL must start with http:// or https://",
 errPort:"Frontend port must be 2-5 digits",
 msgConn:"Connecting to ",
 msgConnOk:"WiFi Connected",
@@ -301,6 +311,8 @@ document.getElementById('srvCusTip1').textContent=t('srvCusTip1');
 document.getElementById('srvCusTip2').textContent=t('srvCusTip2');
 document.getElementById('srvIn').placeholder=t('srvUrlPh');
 document.getElementById('frontendPortIn').placeholder=t('srvPortPh');
+document.getElementById('lblDirectImage').textContent=t('lblDirectImage');
+document.getElementById('directImageIn').placeholder=t('directImagePh');
 document.getElementById('btnConnText').textContent=t('btnConn');
 document.getElementById('s2Title').textContent=t('s2Title');
 document.getElementById('s2Next').textContent=t('s2Next');
@@ -417,18 +429,20 @@ var s=ssid||document.getElementById('ssidIn').value.trim();
 var p=document.getElementById('pwIn').value;
 var sv=srvMode==='official'?OFFICIAL_SERVER:document.getElementById('srvIn').value.trim();
 var fp=srvMode==='official'?LOCAL_DEFAULT_FRONTEND_PORT:document.getElementById('frontendPortIn').value.trim();
+var du=document.getElementById('directImageIn').value.trim();
 var st=document.getElementById('pSt'),btn=document.getElementById('cBtn');
 if(!s){st.className='st e';st.textContent=t('errSsid');return;}
 if(!p){st.className='st e';st.textContent=t('errPw');return;}
 if(p.length<8){st.className='st e';st.textContent=t('errPwLen');return;}
 if(sv&&!sv.match(/^https?:\/\//)){st.className='st e';st.textContent=t('errUrl');return;}
+if(du&&!du.match(/^https?:\/\//)){st.className='st e';st.textContent=t('errDirectImageUrl');return;}
 if(srvMode==='custom'&&!/^\d{2,5}$/.test(fp)){st.className='st e';st.textContent=t('errPort');return;}
 btn.classList.add('ld');btn.disabled=true;
 st.className='st c';st.textContent=t('msgConn')+s+' ...';
 srvUrl=normalizeServerUrl(sv);
 frontendPort=fp;
 
-var fd=new FormData();fd.append('ssid',s);fd.append('pass',p);if(srvUrl)fd.append('server',srvUrl);
+var fd=new FormData();fd.append('ssid',s);fd.append('pass',p);if(srvUrl)fd.append('server',srvUrl);fd.append('direct_image_url',du);
 fetch('/save_wifi',{method:'POST',body:fd}).then(function(r){return r.json()}).then(function(d){
 btn.classList.remove('ld');btn.disabled=false;
 if(d.ok){
@@ -529,6 +543,7 @@ document.getElementById('wScanLoading').innerHTML='扫描失败，请刷新页�
 fetch('/info').then(function(r){return r.json()}).then(function(d){
 if(d.mac){devMac=d.mac;document.getElementById('devMAC').textContent=d.mac;}
 if(d.battery)document.getElementById('devBat').textContent=d.battery;
+if(typeof d.direct_image_url==='string')document.getElementById('directImageIn').value=d.direct_image_url;
 if(d.server_url){
 srvUrl=normalizeServerUrl(d.server_url);
 if(/(^|\/\/)(web\.|www\.)?inksight\.site(:|\/|$)/i.test(srvUrl)){

@@ -25,6 +25,10 @@
 #define GPIO_PIN_SET   1
 #define GPIO_PIN_RESET 0
 
+#ifndef EPD_WFT_SPI_DELAY_US
+#define EPD_WFT_SPI_DELAY_US 0
+#endif
+
 void EPD_initSPI()
 {
     pinMode(PIN_SPI_BUSY,  INPUT);
@@ -76,7 +80,13 @@ void EpdSpiTransferCallback(byte data)
 
         data <<= 1;
         digitalWrite(PIN_SPI_SCK, GPIO_PIN_SET);
+#if EPD_WFT_SPI_DELAY_US > 0
+        delayMicroseconds(EPD_WFT_SPI_DELAY_US);
+#endif
         digitalWrite(PIN_SPI_SCK, GPIO_PIN_RESET);
+#if EPD_WFT_SPI_DELAY_US > 0
+        delayMicroseconds(EPD_WFT_SPI_DELAY_US);
+#endif
     }
 }
 
@@ -185,7 +195,17 @@ void EPD_WaitUntilIdle()
 void EPD_WaitUntilIdle_high() 
 {
     //1: busy, 0: idle
-    while(digitalRead(PIN_SPI_BUSY) == 1) delay(100);    
+    int timeout = 0;
+    Serial.println("EPD_WaitUntilIdle_high: waiting");
+    while(digitalRead(PIN_SPI_BUSY) == 1) {
+        delay(100);
+        timeout++;
+        if (timeout > 100) {
+            Serial.println("EPD_WaitUntilIdle_high timeout!");
+            break;
+        }
+    }
+    Serial.println("EPD_WaitUntilIdle_high: done");
 }
 
 /* Send a one-argument command -----------------------------------------------*/
@@ -409,7 +429,11 @@ struct EPD_dispInfo
 EPD_dispInfo EPD_dispMass[] =
 {
     { EPD_Init_4in2,		EPD_loadA,		-1  ,	0,				EPD_showB,			"4.2 inch"		},// N 13
+#if defined(EPD_WFT_USE_V2)
+    { EPD_Init_4in2b_V2,	EPD_4IN2B_V2_load,	0x13,	EPD_4IN2B_V2_load,	EPD_4IN2B_V2_Show,	"4.2 inch b V2"	},// O 14
+#else
     { EPD_Init_4in2b,		EPD_loadA,		0x13,	EPD_loadA,		EPD_showB,  		"4.2 inch b"	},// O 14
+#endif
 };
 
 /* Initialization of an e-Paper ----------------------------------------------*/

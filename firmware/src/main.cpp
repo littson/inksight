@@ -121,6 +121,28 @@ static uint32_t computeChecksum(const uint8_t *buf, int len) {
     return sum;
 }
 
+#if defined(EPD_DIAG_COLOR_BARS) && EPD_BPP >= 2
+static void fillColorBars2bpp() {
+    if (!ensureColorBuf()) return;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x += 4) {
+            uint8_t color;
+            if (x < W / 3) {
+                color = 0x00; // black
+            } else if (x < (W * 2) / 3) {
+                color = 0x01; // red
+            } else {
+                color = 0x03; // white
+            }
+            colorBuf[(y * W + x) / 4] = (color << 6) | (color << 4) | (color << 2) | color;
+        }
+    }
+    useColorBuf = true;
+    memset(imgBuf, 0xFF, IMG_BUF_LEN);
+    Serial.println("[EPD-DIAG] Filled built-in 2bpp color bars");
+}
+#endif
+
 // ── Forward declarations ────────────────────────────────────
 static void checkConfigButton();
 static void triggerImmediateRefresh(bool nextMode = false, bool keepWiFi = false);
@@ -569,7 +591,7 @@ void setup() {
     }
     bool hasConfig = (cfgSSID.length() > 0);
 
-    if (forcePortal || !hasConfig || cfgServer.length() == 0) {
+    if (forcePortal || !hasConfig || (cfgServer.length() == 0 && cfgDirectImageUrl.length() == 0)) {
         Serial.println(forcePortal ? "[PORTAL] Button held -> portal" : "[PORTAL] No config -> portal");
         String mac = WiFi.macAddress();
         String apName = "InkSight-" + mac.substring(mac.length() - 5);
@@ -710,8 +732,8 @@ void setup() {
         return;
     }
 
-    if (cfgServer.length() == 0) {
-        Serial.println("No server URL configured -> portal");
+    if (cfgServer.length() == 0 && cfgDirectImageUrl.length() == 0) {
+        Serial.println("No server URL or direct image URL configured -> portal");
         enterPortalMode();
         return;
     }
@@ -766,6 +788,11 @@ void setup() {
         enterPortalMode();
         return;
     }
+#if defined(EPD_DIAG_COLOR_BARS) && EPD_BPP >= 2
+    fillColorBars2bpp();
+    ok = true;
+    gotFallback = false;
+#endif
     if (!ok || gotFallback) {
         if (!waitForContentReady()) {
             ledFeedback("fail");
@@ -777,14 +804,21 @@ void setup() {
     resetRetryCount();
 
     cacheSave(imgBuf, IMG_BUF_LEN);
-    lastContentChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
+    uint32_t initialChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
     syncNTP();
     Serial.println("Displaying image...");
     smartDisplay(imgBuf);
-    ledFeedback("success");
-    Serial.println("Display done");
-    lastRenderedPeriod = currentPeriodIndex();
-    ctx.lastClockTick = millis();
+    if (epdLastDisplayOk()) {
+        lastContentChecksum = initialChecksum;
+        ledFeedback("success");
+        Serial.println("Display done");
+        lastRenderedPeriod = currentPeriodIndex();
+        ctx.lastClockTick = millis();
+    } else {
+        lastContentChecksum = 0;
+        ledFeedback("fail");
+        Serial.println("Display failed; will retry same content");
+    }
 
     bool aiChatRequested = renderedModeId.equalsIgnoreCase(AI_CHAT_MODE_ID);
     if (aiChatRequested) {
@@ -802,9 +836,14 @@ void setup() {
                 lastContentChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
                 syncNTP();
                 smartDisplay(imgBuf);
-                ledFeedback("success");
-                lastRenderedPeriod = currentPeriodIndex();
-                ctx.lastClockTick = millis();
+                if (epdLastDisplayOk()) {
+                    ledFeedback("success");
+                    lastRenderedPeriod = currentPeriodIndex();
+                    ctx.lastClockTick = millis();
+                } else {
+                    lastContentChecksum = 0;
+                    ledFeedback("fail");
+                }
             }
         }
     }
@@ -833,7 +872,7 @@ void setup() {
     Serial.printf("[DEBUG] Staying awake, refresh every %d min (user config: %d min)\n",
                   DEBUG_REFRESH_MIN, cfgSleepMin);
 #else
-    Serial.printf("Staying awake, refresh every %d min\n", cfgSleepMin);
+    Serial.printf("Staying awake, refresh every %d min\n", DISPLAY_REFRESH_MIN);
 #endif
 }
 
@@ -969,18 +1008,9 @@ void loop() {
     }
 
     if (!ctx.liveMode) {
-        unsigned long refreshInterval = 0;
-#if DEBUG_MODE
-        refreshInterval = (unsigned long)DEBUG_REFRESH_MIN * 60000UL;
-#else
-        refreshInterval = (unsigned long)cfgSleepMin * 60000UL;
-#endif
+        unsigned long refreshInterval = (unsigned long)DISPLAY_REFRESH_MIN * 60000UL;
         if (millis() - ctx.setupDoneAt >= refreshInterval) {
-#if DEBUG_MODE
-            Serial.printf("[DEBUG] %d min elapsed, refreshing content...\n", DEBUG_REFRESH_MIN);
-#else
-            Serial.printf("%d min elapsed, refreshing content...\n", cfgSleepMin);
-#endif
+            Serial.printf("%d min elapsed, refreshing content...\n", DISPLAY_REFRESH_MIN);
             triggerImmediateRefresh();
             ctx.setupDoneAt = millis();
         }
@@ -1057,20 +1087,37 @@ static void enterDeepSleep(int minutes) {
 
 // ── Failure handler ─────────────────────────────────────────
 
-static void showFailureDiagnostic(const char *reason) {
+static void showFailureDiagnostic(const char *reason, const char *line4) {
     char l2[64], l3[64];
     snprintf(l2, sizeof(l2), "SSID: %.40s", cfgSSID.c_str());
-    snprintf(l3, sizeof(l3), "URL: %.44s", cfgServer.c_str());
-    showDiagnostic(reason, l2, l3, "Hold BOOT to reconfigure");
+    const String &url = cfgDirectImageUrl.length() > 0 ? cfgDirectImageUrl : cfgServer;
+    snprintf(l3, sizeof(l3), "URL: %.44s", url.c_str());
+    showDiagnostic(reason, l2, l3, line4);
 }
 
 static void handleFailure(const char *reason) {
     Serial.printf("[DIAG] %s | SSID=%s | Server=%s\n",
                   reason, cfgSSID.c_str(), cfgServer.c_str());
-    showFailureDiagnostic(reason);
+
+    bool wifiFailed = (strcmp(reason, "WiFi failed") == 0);
+    int retryCount = getRetryCount();
+
+    if (wifiFailed && retryCount < MAX_RETRY_COUNT) {
+        int delaySec = RETRY_DELAYS[retryCount];
+        char line4[64];
+        snprintf(line4, sizeof(line4), "Retry %d/%d in %ds", retryCount + 1, MAX_RETRY_COUNT, delaySec);
+        showFailureDiagnostic("WIFI FAILED", line4);
+        setRetryCount(retryCount + 1);
+        Serial.printf("%s, retry %d/%d in %ds...\n",
+                      reason, retryCount + 1, MAX_RETRY_COUNT, delaySec);
+        delay((unsigned long)delaySec * 1000);
+        ESP.restart();
+    }
+
+    showFailureDiagnostic(reason, "Hold BOOT to reconfigure");
     delay(5000);
 
-    if (cacheLoad(imgBuf, IMG_BUF_LEN)) {
+    if (!wifiFailed && cacheLoad(imgBuf, IMG_BUF_LEN)) {
         Serial.println("Showing cached content (offline mode)");
         const int offlineScale = 2;
         const int offlineLen = 7;
@@ -1092,7 +1139,6 @@ static void handleFailure(const char *reason) {
         return;
     }
 
-    int retryCount = getRetryCount();
     if (retryCount < MAX_RETRY_COUNT) {
         int delaySec = RETRY_DELAYS[retryCount];
         setRetryCount(retryCount + 1);
@@ -1120,11 +1166,7 @@ static void handleLiveMode() {
     if (!ctx.liveMode) return;
 
     unsigned long now = millis();
-#if DEBUG_MODE
-    unsigned long refreshInterval = (unsigned long)DEBUG_REFRESH_MIN * 60000UL;
-#else
-    unsigned long refreshInterval = (unsigned long)cfgSleepMin * 60000UL;
-#endif
+    unsigned long refreshInterval = (unsigned long)DISPLAY_REFRESH_MIN * 60000UL;
     if (WiFi.status() != WL_CONNECTED) {
         if (now - ctx.lastLiveWiFiRetryAt >= (unsigned long)LIVE_WIFI_RETRY_MS) {
             ctx.lastLiveWiFiRetryAt = now;
@@ -1161,11 +1203,7 @@ static void handleLiveMode() {
     }
 
     if (millis() - ctx.setupDoneAt >= refreshInterval) {
-#if DEBUG_MODE
-        Serial.printf("[LIVE][DEBUG] Fallback %d min elapsed, refreshing content...\n", DEBUG_REFRESH_MIN);
-#else
-        Serial.printf("[LIVE] Fallback %d min elapsed, refreshing content...\n", cfgSleepMin);
-#endif
+        Serial.printf("[LIVE] %d min elapsed, refreshing content...\n", DISPLAY_REFRESH_MIN);
         triggerImmediateRefresh(false, true);
         ctx.setupDoneAt = millis();
     }
@@ -1668,15 +1706,21 @@ static void triggerImmediateRefresh(bool nextMode, bool keepWiFi) {
             newChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
 #endif
             syncNTP();
-            if (newChecksum == lastContentChecksum && !nextMode) {
+            if (newChecksum == lastContentChecksum && !nextMode && epdLastDisplayOk()) {
                 Serial.println("Content unchanged, skipping display refresh");
                 ledFeedback("success");
             } else {
                 Serial.println("Displaying new content...");
                 smartDisplay(imgBuf);
-                lastContentChecksum = newChecksum;
-                ledFeedback("success");
-                Serial.println("Display done");
+                if (epdLastDisplayOk()) {
+                    lastContentChecksum = newChecksum;
+                    ledFeedback("success");
+                    Serial.println("Display done");
+                } else {
+                    lastContentChecksum = 0;
+                    ledFeedback("fail");
+                    Serial.println("Display failed; will retry same content");
+                }
             }
 
             if (aiChatRequested) {
@@ -1696,8 +1740,13 @@ static void triggerImmediateRefresh(bool nextMode, bool keepWiFi) {
                         uint32_t newChecksum2 = computeChecksum(imgBuf, IMG_BUF_LEN);
                         syncNTP();
                         smartDisplay(imgBuf);
-                        lastContentChecksum = newChecksum2;
-                        ledFeedback("success");
+                        if (epdLastDisplayOk()) {
+                            lastContentChecksum = newChecksum2;
+                            ledFeedback("success");
+                        } else {
+                            lastContentChecksum = 0;
+                            ledFeedback("fail");
+                        }
                     }
                 }
             }
@@ -1715,11 +1764,17 @@ static void triggerImmediateRefresh(bool nextMode, bool keepWiFi) {
                     uint32_t retryChecksum = computeChecksum(imgBuf, IMG_BUF_LEN);
                     syncNTP();
                     smartDisplay(imgBuf);
-                    lastContentChecksum = retryChecksum;
-                    lastRenderedPeriod = currentPeriodIndex();
-                    ctx.lastClockTick = millis();
-                    ledFeedback("success");
-                    Serial.println("Retry succeeded");
+                    if (epdLastDisplayOk()) {
+                        lastContentChecksum = retryChecksum;
+                        lastRenderedPeriod = currentPeriodIndex();
+                        ctx.lastClockTick = millis();
+                        ledFeedback("success");
+                        Serial.println("Retry succeeded");
+                    } else {
+                        lastContentChecksum = 0;
+                        ledFeedback("fail");
+                        Serial.println("Retry fetched content but display failed");
+                    }
                 } else {
                     ledFeedback("fail");
                     Serial.println("Retry also failed, keeping old content");
@@ -1799,8 +1854,9 @@ static void checkConfigButton() {
         } else {
             unsigned long holdTime = millis() - ctx.btnPressStart;
             if (holdTime >= (unsigned long)CFG_BTN_HOLD_MS) {
-                Serial.printf("Config button held for %dms, restarting...\n", CFG_BTN_HOLD_MS);
-                ESP.restart();
+                Serial.printf("Config button held for %dms -> portal\n", CFG_BTN_HOLD_MS);
+                enterPortalMode();
+                return;
             }
         }
     } else {

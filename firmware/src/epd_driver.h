@@ -15,6 +15,9 @@ void epdInitFast();
 // Full-screen display with full refresh (clears ghosting, has black-white flash)
 void epdDisplay(const uint8_t *image);
 
+// Whether the most recent full-screen display attempt completed without a detected timeout
+bool epdLastDisplayOk();
+
 // Deep clear: multi-cycle black/white flush then display image (eliminates stubborn ghosting)
 void epdDisplayDeepClear(const uint8_t *image);
 

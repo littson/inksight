@@ -185,6 +185,18 @@ int EPD_Init_4in2b()
 int EPD_Init_4in2b_V2() 
 {
  Serial.print("\r\nEPD_Init_4in2b_V2\r\n");
+#if defined(EPD_WFT_V2_FORCE_LEGACY_BRANCH)
+    flag = 1;
+    EPD_Reset();
+
+    EPD_SendCommand(0x04);
+    EPD_WaitUntilIdle();
+    EPD_Send_1(0x00, 0x0F);//PANEL_SETTING
+
+    EPD_SendCommand(0x10);//DATA_START_TRANSMISSION_1
+    delay(2);
+    return 0;
+#else
         unsigned char i;
     EPD_Reset();
     
@@ -229,6 +241,7 @@ int EPD_Init_4in2b_V2()
         
     }
     return 0;
+#endif
 }
 
 

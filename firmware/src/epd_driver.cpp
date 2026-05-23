@@ -749,13 +749,29 @@ void epdSleep() {
 // ── Other panel sizes: GxEPD2 (hardware SPI) ─────────────────
 
 #include <SPI.h>
+#if defined(EPD_PANEL_42_GXEPD2_GDEY042Z98) || defined(EPD_PANEL_42_GXEPD2_420C) || defined(EPD_PANEL_42_GXEPD2_420C_Z21)
+#include <GxEPD2_3C.h>
+#else
 #include <GxEPD2_BW.h>
+#endif
 
 #ifndef EPD_GXEPD2_SPI_HZ
 #define EPD_GXEPD2_SPI_HZ 4000000
 #endif
 
-#if defined(EPD_PANEL_42_GXEPD2_T81)
+#if defined(EPD_PANEL_42_GXEPD2_GDEY042Z98)
+  #include <gdey3c/GxEPD2_420c_GDEY042Z98.h>
+  GxEPD2_3C<GxEPD2_420c_GDEY042Z98, GxEPD2_420c_GDEY042Z98::HEIGHT> display(
+      GxEPD2_420c_GDEY042Z98(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
+#elif defined(EPD_PANEL_42_GXEPD2_420C)
+  #include <epd3c/GxEPD2_420c.h>
+  GxEPD2_3C<GxEPD2_420c, GxEPD2_420c::HEIGHT> display(
+      GxEPD2_420c(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
+#elif defined(EPD_PANEL_42_GXEPD2_420C_Z21)
+  #include <epd3c/GxEPD2_420c_Z21.h>
+  GxEPD2_3C<GxEPD2_420c_Z21, GxEPD2_420c_Z21::HEIGHT> display(
+      GxEPD2_420c_Z21(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
+#elif defined(EPD_PANEL_42_GXEPD2_T81)
   #include <gdey/GxEPD2_420_GDEY042T81.h>
   GxEPD2_BW<GxEPD2_420_GDEY042T81, GxEPD2_420_GDEY042T81::HEIGHT / 4> display(
       GxEPD2_420_GDEY042T81(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
@@ -811,15 +827,16 @@ void epdSleep() {
   GxEPD2_BW<GxEPD2_750_T7, GxEPD2_750_T7::HEIGHT / 4> display(
       GxEPD2_750_T7(PIN_EPD_CS, PIN_EPD_DC, PIN_EPD_RST, PIN_EPD_BUSY));
 #else
-  #error "No EPD panel type defined. Use -DEPD_PANEL_42_SSD1683_BW, -DEPD_PANEL_42_DKE_RY683, -DEPD_PANEL_42_GDEM042F52, -DEPD_PANEL_42_GXEPD2_T81, -DEPD_PANEL_42_GXEPD2_GYE042A87, -DEPD_PANEL_42_GXEPD2_420, -DEPD_PANEL_42_GXEPD2_M01, -DEPD_PANEL_29, -DEPD_PANEL_583_UC8179, -DEPD_PANEL_583, or -DEPD_PANEL_75"
+  #error "No EPD panel type defined. Use -DEPD_PANEL_42_SSD1683_BW, -DEPD_PANEL_42_DKE_RY683, -DEPD_PANEL_42_GDEM042F52, -DEPD_PANEL_42_GXEPD2_GDEY042Z98, -DEPD_PANEL_42_GXEPD2_420C, -DEPD_PANEL_42_GXEPD2_T81, -DEPD_PANEL_42_GXEPD2_GYE042A87, -DEPD_PANEL_42_GXEPD2_420, -DEPD_PANEL_42_GXEPD2_M01, -DEPD_PANEL_29, -DEPD_PANEL_583_UC8179, -DEPD_PANEL_583, or -DEPD_PANEL_75"
 #endif
 
 static bool _initialized = false;
+static bool _last_display_ok = true;
 #if defined(EPD_PANEL_42_GXEPD2_GYE042A87)
 static bool _needs_full_refresh_write = true;
 #endif
 static const uint8_t DISPLAY_ROTATION =
-#if defined(EPD_PANEL_42_GXEPD2_T81) || defined(EPD_PANEL_42_GXEPD2_GYE042A87) || defined(EPD_PANEL_42_GXEPD2_420) || defined(EPD_PANEL_42_GXEPD2_M01)
+#if defined(EPD_PANEL_42_GXEPD2_GDEY042Z98) || defined(EPD_PANEL_42_GXEPD2_420C) || defined(EPD_PANEL_42_GXEPD2_420C_Z21) || defined(EPD_PANEL_42_GXEPD2_T81) || defined(EPD_PANEL_42_GXEPD2_GYE042A87) || defined(EPD_PANEL_42_GXEPD2_420) || defined(EPD_PANEL_42_GXEPD2_M01)
     0;
 #else
     1;
@@ -843,7 +860,62 @@ void epdInitFast() {
     epdInit();
 }
 
+bool epdLastDisplayOk() {
+    return _last_display_ok;
+}
+
+#if defined(EPD_PANEL_42_GXEPD2_GYE042A87)
+static void epdHardReinit() {
+    display.epd2.selectSPI(SPI, SPISettings(EPD_GXEPD2_SPI_HZ, MSBFIRST, SPI_MODE0));
+    display.init(0, true, 100, false);
+    display.setRotation(DISPLAY_ROTATION);
+    _initialized = true;
+    _needs_full_refresh_write = true;
+}
+
+static bool epdDisplayGye042a87Once(const uint8_t *image) {
+    epdHardReinit();
+    display.epd2.writeImageForFullRefresh(image, 0, 0, W, H, false, false, false);
+    _needs_full_refresh_write = false;
+    unsigned long refreshStart = millis();
+    display.refresh(false);
+    unsigned long refreshMs = millis() - refreshStart;
+    int busy = digitalRead(PIN_EPD_BUSY);
+    if (busy != LOW) {
+        unsigned long waitStart = millis();
+        while (digitalRead(PIN_EPD_BUSY) != LOW && millis() - waitStart < 20000) {
+            delay(100);
+        }
+        refreshMs += millis() - waitStart;
+        busy = digitalRead(PIN_EPD_BUSY);
+    }
+    bool ok = busy == LOW;
+    Serial.printf("[EPD] refresh elapsed %lums BUSY=%d\n", refreshMs, busy);
+    if (!ok) {
+        Serial.println("[EPD] refresh timed out or BUSY still active");
+    }
+    display.hibernate();
+    _initialized = false;
+    _needs_full_refresh_write = true;
+    delay(200);
+    return ok;
+}
+#endif
+
 void epdDisplay(const uint8_t *image) {
+#if defined(EPD_PANEL_42_GXEPD2_GYE042A87)
+    _last_display_ok = false;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        Serial.printf("[EPD] GYE042A87 full refresh attempt %d\n", attempt + 1);
+        if (epdDisplayGye042a87Once(image)) {
+            _last_display_ok = true;
+            return;
+        }
+        delay(800);
+    }
+    Serial.println("[EPD] GYE042A87 refresh failed after retry");
+    return;
+#endif
     epdInit();
 #if defined(EPD_PANEL_29)
     rotate_landscape_to_panel(image);
@@ -857,18 +929,12 @@ void epdDisplay(const uint8_t *image) {
         false,
         false
     );
-#elif defined(EPD_PANEL_42_GXEPD2_GYE042A87)
-    if (_needs_full_refresh_write) {
-        display.epd2.writeImageForFullRefresh(image, 0, 0, W, H, false, false, false);
-        _needs_full_refresh_write = false;
-    } else {
-        display.writeImage(image, 0, 0, W, H, false, false, false);
-    }
 #else
     display.writeImage(image, 0, 0, W, H, false, false, false);
 #endif
     display.refresh(false);
     display.powerOff();
+    _last_display_ok = true;
 }
 
 void epdDisplayFast(const uint8_t *image) {
@@ -916,6 +982,55 @@ void epdDisplayDeepClear(const uint8_t *image) {
     }
 
     epdDisplay(image);
+}
+
+void epdDisplay2bpp(const uint8_t *image2bpp) {
+#if (defined(EPD_PANEL_42_GXEPD2_420C) || defined(EPD_PANEL_42_GXEPD2_420C_Z21) || defined(EPD_PANEL_42_GXEPD2_GDEY042Z98)) && EPD_BPP >= 2
+    epdInit();
+    uint8_t *blackPlane = (uint8_t *)malloc(IMG_BUF_LEN);
+    uint8_t *redPlane = (uint8_t *)malloc(IMG_BUF_LEN);
+    if (!blackPlane || !redPlane) {
+        Serial.println("[EPD] 2bpp conversion buffer alloc failed");
+        free(blackPlane);
+        free(redPlane);
+        _last_display_ok = false;
+        return;
+    }
+
+    memset(blackPlane, 0xFF, IMG_BUF_LEN);
+    memset(redPlane, 0xFF, IMG_BUF_LEN);
+    int blackPixels = 0;
+    int redPixels = 0;
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            int pixel = y * W + x;
+            uint8_t packed = image2bpp[pixel / 4];
+            uint8_t color = (packed >> (6 - (pixel % 4) * 2)) & 0x03;
+            int out = y * (W / 8) + (x / 8);
+            uint8_t mask = 0x80 >> (x % 8);
+
+            if (color == 0x00) {
+                blackPlane[out] &= ~mask;
+                blackPixels++;
+            } else if (color == 0x01 || color == 0x02) {
+                redPlane[out] &= ~mask;
+                redPixels++;
+            }
+        }
+    }
+    Serial.printf("[EPD] packed 2bpp -> 3C planes black=%d red=%d\n", blackPixels, redPixels);
+    Serial.printf("[EPD] 3C two-plane refresh BUSY=%d\n", digitalRead(PIN_EPD_BUSY));
+    display.writeImage(blackPlane, redPlane, 0, 0, W, H, false, false, false);
+    Serial.printf("[EPD] 3C data written BUSY=%d\n", digitalRead(PIN_EPD_BUSY));
+    display.refresh(false);
+    Serial.printf("[EPD] 3C refresh returned BUSY=%d\n", digitalRead(PIN_EPD_BUSY));
+    display.powerOff();
+    free(blackPlane);
+    free(redPlane);
+    _last_display_ok = true;
+#else
+    epdDisplay(image2bpp);
+#endif
 }
 
 void epdPartialDisplay(uint8_t *data, int xStart, int yStart, int xEnd, int yEnd) {

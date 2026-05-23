@@ -18,6 +18,7 @@ int    cfgSleepMin;
 String cfgConfigJson;
 String cfgDeviceToken;
 String cfgPendingPairCode;
+String cfgDirectImageUrl;
 
 // ── Load config from NVS ────────────────────────────────────
 
@@ -36,6 +37,7 @@ void loadConfig() {
         cfgConfigJson = "";
         cfgDeviceToken = "";
         cfgPendingPairCode = "";
+        cfgDirectImageUrl = "";
         return;
     }
 
@@ -46,6 +48,7 @@ void loadConfig() {
     cfgConfigJson   = prefs.getString("config_json", "");
     cfgDeviceToken  = prefs.getString("device_token", "");
     cfgPendingPairCode = prefs.getString("pair_code", "");
+    cfgDirectImageUrl = prefs.getString("direct_img_url", "");
     prefs.end();
 
     // Sanity checks
@@ -54,6 +57,9 @@ void loadConfig() {
     }
     if (cfgServer.length() > 200) {
         cfgServer = DEFAULT_SERVER;
+    }
+    if (cfgDirectImageUrl.length() > 300) {
+        cfgDirectImageUrl = "";
     }
 }
 
@@ -112,6 +118,20 @@ void saveServerUrl(const String &url) {
     prefs.putString("server", url);
     prefs.end();
     cfgServer = url;
+}
+
+void saveDirectImageUrl(const String &url) {
+    String cleaned = url.substring(0, 300);
+    cleaned.trim();
+    prefs.begin("inksight", false);
+    prefs.putInt("cfg_version", CONFIG_VERSION);
+    if (cleaned.length() > 0) {
+        prefs.putString("direct_img_url", cleaned);
+    } else {
+        prefs.remove("direct_img_url");
+    }
+    prefs.end();
+    cfgDirectImageUrl = cleaned;
 }
 
 // ── Save user config JSON ───────────────────────────────────

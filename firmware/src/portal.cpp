@@ -27,6 +27,7 @@ static DNSServer dnsServer;
 static const int PORTAL_MAX_SSID   = 32;
 static const int PORTAL_MAX_PASS   = 64;
 static const int PORTAL_MAX_URL    = 200;
+static const int PORTAL_MAX_DIRECT_IMAGE_URL = 300;
 static const int PORTAL_MAX_CONFIG = 2048;
 
 static String sanitizeInput(const String &input, int maxLen) {
@@ -162,7 +163,8 @@ void startCaptivePortal() {
         float v = readBatteryVoltage();
         String json = "{\"mac\":\"" + WiFi.macAddress() + "\",";
         json += "\"battery\":\"" + String(v, 2) + "V\",";
-        json += "\"server_url\":\"" + cfgServer + "\"}";
+        json += "\"server_url\":\"" + cfgServer + "\",";
+        json += "\"direct_image_url\":\"" + cfgDirectImageUrl + "\"}";
         webServer.send(200, "application/json", json);
     });
 
@@ -188,10 +190,12 @@ void startCaptivePortal() {
         String ssid = sanitizeSSID(webServer.arg("ssid"));
         String pass = sanitizeTextInput(webServer.arg("pass"), PORTAL_MAX_PASS);
         String serverUrl = sanitizeInput(webServer.arg("server"), PORTAL_MAX_URL);
+        String directImageUrl = sanitizeInput(webServer.arg("direct_image_url"), PORTAL_MAX_DIRECT_IMAGE_URL);
 
         Serial.printf("\n--- /save_wifi Request ---\n");
         Serial.printf("SSID: %s\n", ssid.c_str());
         Serial.printf("Server: %s\n", serverUrl.c_str());
+        Serial.printf("Direct image URL: %s\n", directImageUrl.length() > 0 ? directImageUrl.c_str() : "(empty)");
 
         if (ssid.length() == 0) {
             Serial.println("Error: SSID empty");
@@ -212,6 +216,14 @@ void startCaptivePortal() {
             saveServerUrl(serverUrl);
             Serial.printf("Server URL saved: %s\n", serverUrl.c_str());
         }
+
+        if (directImageUrl.length() > 0 && !isValidUrl(directImageUrl)) {
+            webServer.send(200, "application/json",
+                           "{\"ok\":false,\"msg\":\"直接图片 URL 必须以 http:// 或 https:// 开头\"}");
+            return;
+        }
+        saveDirectImageUrl(directImageUrl);
+        Serial.printf("Direct image URL %s\n", directImageUrl.length() > 0 ? "saved" : "cleared");
 
         Serial.printf("Portal: connecting to %s\n", ssid.c_str());
         wifiConnecting = true;

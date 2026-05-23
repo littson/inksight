@@ -11,6 +11,7 @@ extern int    cfgSleepMin;
 extern String cfgConfigJson;
 extern String cfgDeviceToken;
 extern String cfgPendingPairCode;
+extern String cfgDirectImageUrl;
 
 // ── NVS operations ──────────────────────────────────────────
 
@@ -22,6 +23,9 @@ void saveWiFiConfig(const String &ssid, const String &pass);
 
 // Save server URL to NVS
 void saveServerUrl(const String &url);
+
+// Save direct image URL to NVS
+void saveDirectImageUrl(const String &url);
 
 // Save user config JSON to NVS (also extracts refreshInterval)
 void saveUserConfig(const String &configJson);
